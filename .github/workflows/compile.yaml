@@ -1,0 +1,66 @@
+name: release
+on: [push]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - run: sudo apt install git bc bison flex libssl-dev make libc6-dev libncurses5-dev crossbuild-essential-arm64 ccache
+      - run: KERNEL=8
+      - run: make -j$(nproc) EXTRAVERSION=-kubix ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2711_kubix_defconfig
+      - run: echo "KERNELRELEASE=$(make -j32 EXTRAVERSION=-kubix ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)" >> $GITHUB_ENV
+      - run: make -j$(nproc) EXTRAVERSION=-kubix ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image.gz modules dtbs
+      - run: mkdir -p artifacts/boot/overlays
+      - run: cp arch/arm64/boot/Image.gz artifacts/boot/vmlinuz-${{ env.KERNELRELEASE }}
+      - run: cp arch/arm64/boot/dts/broadcom/*.dtb artifacts/boot/
+      - run: cp arch/arm64/boot/dts/overlays/*.dtb* artifacts/boot/overlays/
+      - run: cp arch/arm64/boot/dts/overlays/README artifacts/boot/overlays/
+      - run: make -j$(nproc) EXTRAVERSION=-kubix ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=artifacts modules_install
+      - run: rm -f artifacts/lib/modules/${{ env.KERNELRELEASE }}/{build,source}
+      - uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.KERNELRELEASE }}
+          path: artifacts/
+  ubuntu-img:
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v2
+      - run: KERNEL=8
+      - run: make -j4 EXTRAVERSION=-kubix ARCH=arm64 bcm2711_kubix_defconfig
+      - run: echo "KERNELRELEASE=$(make -j32 EXTRAVERSION=-kubix ARCH=arm64 kernelrelease)" >> $GITHUB_ENV
+      - run: wget https://cdimage.ubuntu.com/releases/22.04/release/ubuntu-22.04-preinstalled-server-arm64+raspi.img.xz
+      - run: xz --decompress --threads=0 ubuntu-22.04-preinstalled-server-arm64+raspi.img.xz
+      - run: mkdir -p $PWD/system-boot
+      - run: sudo mount -o loop,rw,offset=1048576,sizelimit=268435456 ubuntu-22.04-preinstalled-server-arm64+raspi.img $PWD/system-boot
+      - run: mkdir -p $PWD/writable
+      - run: sudo mount -o loop,rw,offset=269484032,sizelimit=3650232320 ubuntu-22.04-preinstalled-server-arm64+raspi.img $PWD/writable
+      - uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.KERNELRELEASE }}
+          path: artifacts
+      - run: sudo cp -f artifacts/boot/vmlinuz-5.15.50-kubix-v8+ $PWD/system-boot/vmlinuz
+      - run: sudo cp -f artifacts/boot/*.dtb $PWD/system-boot/
+      - run: sudo cp -f artifacts/boot/overlays/*.dtb* $PWD/system-boot/overlays/
+      - run: sudo sed -i '$ s/^/cgroup_memory=1 cgroup_enable=memory /' $PWD/system-boot/cmdline.txt
+      - run: sudo cp -rf artifacts/lib/modules/${{ env.KERNELRELEASE }} $PWD/writable/lib/modules/
+      - run: sudo rm -rf $PWD/writable/lib/modules/5.15.0-1005-raspi
+      - run: |
+          cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+          overlay
+          br_netfilter
+          EOF
+      - run: |
+          cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+          EOF
+      - run: sudo umount $PWD/writable
+      - run: sudo umount $PWD/system-boot
+      - run: xz --compress --threads=0 ubuntu-22.04-preinstalled-server-arm64+raspi.img
+      - uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.KERNELRELEASE }}.img
+          path: ubuntu-22.04-preinstalled-server-arm64+raspi.img.xz
